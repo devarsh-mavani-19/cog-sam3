@@ -1,0 +1,39 @@
+# Cog configuration for SAM 3 (Segment Anything Model 3)
+# https://github.com/replicate/cog/blob/main/docs/yaml.md
+#
+# Before building, download the weights locally:
+#   python download_weights.py
+#
+# This places sam3.pt into ./weights/ which gets copied into the image.
+
+build:
+  gpu: true
+  cuda: "12.6"
+  python_version: "3.12"
+
+  system_packages:
+    - "libgl1-mesa-glx"
+    - "libglib2.0-0"
+    - "libsm6"
+    - "libxext6"
+    - "libxrender-dev"
+    - "ffmpeg"
+
+  python_packages:
+    - "torch==2.7.0"
+    - "torchvision==0.22.0"
+    - "pillow>=10.0.0"
+    - "numpy>=1.26.0"
+    - "opencv-python>=4.8.0"
+    - "huggingface-hub>=0.23.0"
+    - "matplotlib>=3.8.0"
+
+  run:
+    # Clone and install SAM 3 from source
+    - "git clone https://github.com/facebookresearch/sam3.git /src/sam3-repo"
+    - "pip install -e /src/sam3-repo"
+    # Copy pre-downloaded weights into the image
+    - "mkdir -p /src/weights"
+    - "cp weights/sam3.pt /src/weights/sam3.pt"
+
+predict: "predict.py:Predictor"
