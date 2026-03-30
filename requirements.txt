@@ -1,0 +1,5 @@
+torch==2.4.1
+git+https://github.com/huggingface/transformers.git@refs/pull/42407/head
+numpy<2.0
+pillow
+opencv-python
