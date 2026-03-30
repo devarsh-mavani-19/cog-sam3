@@ -1,307 +1,277 @@
-"""
-Cog predictor for Meta SAM 3 (Segment Anything Model 3).
-
-Supports:
-  - Text-prompted segmentation: provide a text description to segment matching objects
-  - Box-prompted segmentation: provide a bounding box [cx, cy, w, h] normalized to [0,1]
-  - Automatic segmentation: segment everything in the image without prompts
-
-Outputs a JSON result with masks, bounding boxes, and confidence scores,
-along with an annotated visualization image.
-"""
+# Prediction interface for Cog ⚙️
+# https://cog.run/python
+#
+# SAM 3 image segmentation wrapper.
+# Supports text-prompted and box-prompted segmentation.
 
 import json
+import os
+import subprocess
 import tempfile
-from pathlib import Path
+import time
 from typing import Optional
 
 import cv2
 import numpy as np
 import torch
-from cog import BasePredictor, Input, Path as CogPath
+from cog import BasePredictor, Input, Path
 from PIL import Image
+
+MODEL_PATH = "checkpoints"
+MODEL_URL = "https://weights.replicate.delivery/default/facebook/sam3/model.tar"
+
+
+def download_weights(url, dest):
+    start = time.time()
+    print("downloading url: ", url)
+    print("downloading to: ", dest)
+    subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
+    print("downloading took: ", time.time() - start)
 
 
 class Predictor(BasePredictor):
-    """Cog predictor wrapping Meta SAM 3 for image segmentation."""
-
     def setup(self) -> None:
-        """Load the SAM 3 model into memory on GPU."""
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
+        """Load the SAM 3 model into memory."""
+        from transformers import Sam3Model, Sam3Processor
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Weights are pre-downloaded into the image at build time.
-        # See download_weights.py and cog.yaml for details.
-        WEIGHTS_PATH = "/src/weights/sam3.pt"
-
-        print(f"Loading SAM 3 model on {self.device}...")
-        self.model = build_sam3_image_model(
-            device=self.device,
-            eval_mode=True,
-            checkpoint_path=WEIGHTS_PATH,
-            load_from_HF=False,
-            enable_segmentation=True,
+        self.dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else torch.float16
         )
-        self.processor = Sam3Processor(
-            model=self.model,
-            device=self.device,
+
+        # Download weights on first run
+        if not os.path.exists(MODEL_PATH):
+            download_weights(MODEL_URL, MODEL_PATH)
+
+        print(f"Loading SAM 3 model on {self.device} with {self.dtype}...")
+        self.model = (
+            Sam3Model.from_pretrained(MODEL_PATH)
+            .to(self.device, dtype=self.dtype)
+            .eval()
         )
+        self.processor = Sam3Processor.from_pretrained(MODEL_PATH)
         print("SAM 3 model loaded successfully.")
 
     def predict(
         self,
-        image: CogPath = Input(description="Input image to segment."),
+        image: Path = Input(description="Input image to segment."),
         text_prompt: str = Input(
-            default="",
+            default="object",
             description=(
                 "Text description of the object(s) to segment "
-                '(e.g. "yellow school bus", "person wearing red"). '
-                "Leave empty for automatic segmentation of all objects."
+                '(e.g. "yellow school bus", "person wearing red").'
             ),
         ),
-        box_prompt: str = Input(
-            default="",
+        box_prompt: Optional[str] = Input(
+            default=None,
             description=(
-                "Bounding box prompt as JSON: [center_x, center_y, width, height] "
-                "with values normalized to [0, 1]. "
-                'Example: "[0.5, 0.5, 0.3, 0.4]". '
-                "Leave empty to skip box prompting."
+                "Optional: bounding box as JSON [x1, y1, x2, y2] in pixel coordinates. "
+                'Example: "[100, 200, 400, 500]".'
             ),
         ),
         confidence_threshold: float = Input(
             default=0.5,
             ge=0.0,
             le=1.0,
-            description="Minimum confidence score to include a mask in the output.",
+            description="Minimum confidence score to include a mask in output.",
+        ),
+        mask_opacity: float = Input(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description="Opacity of the mask overlay on the visualization.",
+        ),
+        mask_color: str = Input(
+            default="green",
+            choices=["green", "red", "blue", "yellow", "cyan", "magenta"],
+            description="Color of the mask overlay.",
         ),
         output_format: str = Input(
             default="png",
             choices=["png", "json"],
             description=(
-                "Output format: 'png' returns an annotated visualization image; "
-                "'json' returns raw masks, boxes, and scores as a JSON file."
+                "'png' returns annotated image; "
+                "'json' returns masks, boxes, and scores."
             ),
         ),
-    ) -> CogPath:
+    ) -> Path:
         """Run SAM 3 segmentation on an input image."""
-        # Load the input image
         pil_image = Image.open(str(image)).convert("RGB")
+        width, height = pil_image.size
 
-        # Set confidence threshold
-        self.processor.set_confidence_threshold(confidence_threshold)
-
-        # Encode the image
-        state = self.processor.set_image(pil_image)
-
-        # Run the appropriate inference mode
-        if text_prompt.strip():
-            state = self.processor.set_text_prompt(
-                prompt=text_prompt.strip(),
-                state=state,
-            )
-        elif box_prompt.strip():
+        # Prepare inputs via the processor
+        if box_prompt is not None:
             box = json.loads(box_prompt.strip())
             if not isinstance(box, list) or len(box) != 4:
                 raise ValueError(
-                    "box_prompt must be a JSON list of 4 floats: "
-                    "[center_x, center_y, width, height]"
+                    "box_prompt must be a JSON list of 4 numbers: [x1, y1, x2, y2]"
                 )
-            state = self.processor.add_geometric_prompt(
-                box=[float(v) for v in box],
-                label=True,
-                state=state,
-            )
+            inputs = self.processor(
+                images=pil_image,
+                text=text_prompt,
+                input_boxes=[[box]],
+                return_tensors="pt",
+            ).to(self.device, dtype=self.dtype)
         else:
-            # No prompt provided: use a generic text prompt to detect all objects.
-            # SAM 3 is concept-based; use a broad prompt for general segmentation.
-            state = self.processor.set_text_prompt(
-                prompt="object",
-                state=state,
-            )
+            inputs = self.processor(
+                images=pil_image,
+                text=text_prompt,
+                return_tensors="pt",
+            ).to(self.device, dtype=self.dtype)
 
-        # Extract results from state
-        masks = state.get("masks")
-        boxes = state.get("boxes")
-        scores = state.get("scores")
+        # Run inference
+        with torch.no_grad():
+            outputs = self.model(**inputs)
 
-        if masks is None:
-            masks = []
-            boxes = []
-            scores = []
+        # Post-process to get masks and scores
+        results = self.processor.post_process_segmentation(
+            outputs,
+            target_sizes=[(height, width)],
+        )[0]
 
-        # Convert tensors to numpy for processing
-        if torch.is_tensor(masks):
-            masks_np = masks.cpu().numpy()
-        elif isinstance(masks, list) and len(masks) > 0 and torch.is_tensor(masks[0]):
-            masks_np = torch.stack(masks).cpu().numpy()
-        else:
-            masks_np = np.array(masks) if len(masks) > 0 else np.empty((0,))
+        masks = results.get("masks", None)
+        scores = results.get("scores", None)
+        boxes = results.get("boxes", None)
 
-        if torch.is_tensor(boxes):
-            boxes_np = boxes.cpu().numpy()
-        elif isinstance(boxes, list) and len(boxes) > 0 and torch.is_tensor(boxes[0]):
-            boxes_np = torch.stack(boxes).cpu().numpy()
-        else:
-            boxes_np = np.array(boxes) if len(boxes) > 0 else np.empty((0,))
+        # Convert to numpy
+        masks_np = self._to_numpy(masks)
+        scores_np = self._to_numpy(scores)
+        boxes_np = self._to_numpy(boxes)
 
-        if torch.is_tensor(scores):
-            scores_np = scores.cpu().numpy()
-        elif isinstance(scores, list) and len(scores) > 0 and torch.is_tensor(scores[0]):
-            scores_np = torch.stack(scores).cpu().numpy()
-        else:
-            scores_np = np.array(scores) if len(scores) > 0 else np.empty((0,))
+        # Filter by confidence
+        if scores_np is not None and scores_np.ndim > 0 and len(scores_np) > 0:
+            keep = scores_np >= confidence_threshold
+            scores_np = scores_np[keep]
+            if masks_np is not None and masks_np.ndim > 1:
+                masks_np = masks_np[keep]
+            if boxes_np is not None and boxes_np.ndim > 1:
+                boxes_np = boxes_np[keep]
 
-        # Build output
         if output_format == "json":
             return self._output_json(masks_np, boxes_np, scores_np)
         else:
-            return self._output_visualization(pil_image, masks_np, boxes_np, scores_np)
+            return self._output_visualization(
+                pil_image, masks_np, boxes_np, scores_np,
+                mask_opacity=mask_opacity,
+                mask_color=mask_color,
+            )
 
-    def _output_json(
-        self,
-        masks: np.ndarray,
-        boxes: np.ndarray,
-        scores: np.ndarray,
-    ) -> CogPath:
-        """Save masks, boxes, and scores as a JSON file."""
-        results = {
-            "num_detections": int(len(scores)) if scores.ndim > 0 else 0,
-            "detections": [],
-        }
+    @staticmethod
+    def _to_numpy(tensor):
+        if tensor is None:
+            return np.empty((0,))
+        if torch.is_tensor(tensor):
+            return tensor.cpu().float().numpy()
+        if isinstance(tensor, list):
+            if len(tensor) > 0 and torch.is_tensor(tensor[0]):
+                return torch.stack(tensor).cpu().float().numpy()
+            return np.array(tensor) if len(tensor) > 0 else np.empty((0,))
+        return np.array(tensor)
 
-        num = results["num_detections"]
+    def _output_json(self, masks, boxes, scores) -> Path:
+        """Return detections as a JSON file."""
+        detections = []
+        num = int(len(scores)) if scores.ndim > 0 else 0
         for i in range(num):
-            detection = {
-                "score": float(scores[i]) if scores.ndim > 0 else 0.0,
+            det = {
+                "score": float(scores[i]),
                 "box": boxes[i].tolist() if boxes.ndim > 1 else [],
-                "mask_shape": list(masks[i].shape) if masks.ndim > 2 else [],
-                "mask_rle": self._mask_to_rle(masks[i]) if masks.ndim > 2 else None,
             }
-            results["detections"].append(detection)
+            if masks.ndim > 2:
+                det["mask_rle"] = self._mask_to_rle(masks[i])
+            detections.append(det)
 
-        output_path = Path(tempfile.mktemp(suffix=".json"))
+        result = {"num_detections": num, "detections": detections}
+        output_path = tempfile.mktemp(suffix=".json")
         with open(output_path, "w") as f:
-            json.dump(results, f, indent=2)
-        return CogPath(output_path)
+            json.dump(result, f, indent=2)
+        return Path(output_path)
 
     def _output_visualization(
-        self,
-        pil_image: Image.Image,
-        masks: np.ndarray,
-        boxes: np.ndarray,
-        scores: np.ndarray,
-    ) -> CogPath:
-        """Render an annotated image with mask overlays and bounding boxes."""
+        self, pil_image, masks, boxes, scores,
+        mask_opacity=0.5, mask_color="green",
+    ) -> Path:
+        """Render annotated image with colored mask overlays."""
         img = np.array(pil_image)
         overlay = img.copy()
         h, w = img.shape[:2]
 
+        colors = {
+            "green": [0, 255, 0],
+            "red": [255, 0, 0],
+            "blue": [0, 0, 255],
+            "yellow": [255, 255, 0],
+            "cyan": [0, 255, 255],
+            "magenta": [255, 0, 255],
+        }
+        color_rgb = np.array(
+            colors.get(mask_color.lower(), [0, 255, 0]), dtype=np.uint8
+        )
+
         num = int(len(scores)) if scores.ndim > 0 else 0
-        # Generate distinct colors for each detection
-        colors = self._generate_colors(num)
-
         for i in range(num):
-            color = colors[i]
-
-            # Draw mask overlay
             if masks.ndim > 2:
                 mask = masks[i]
-                # Resize mask to image dimensions if needed
-                if mask.shape[-2:] != (h, w):
-                    mask_resized = cv2.resize(
-                        mask.astype(np.float32),
-                        (w, h),
+                if mask.ndim == 3 and mask.shape[0] == 1:
+                    mask = mask.squeeze(0)
+                elif mask.ndim > 2:
+                    mask = mask.squeeze()
+
+                if mask.shape != (h, w):
+                    mask = cv2.resize(
+                        mask.astype(np.float32), (w, h),
                         interpolation=cv2.INTER_LINEAR,
                     )
-                    mask_bool = mask_resized > 0.5
-                else:
-                    mask_bool = mask > 0.5
+                mask_bool = mask > 0.5
 
-                # Ensure mask is 2D
-                if mask_bool.ndim > 2:
-                    mask_bool = mask_bool.squeeze()
+                # Color overlay
+                overlay[mask_bool] = (
+                    overlay[mask_bool] * (1 - mask_opacity)
+                    + color_rgb * mask_opacity
+                ).astype(np.uint8)
 
-                colored_mask = np.zeros_like(img)
-                colored_mask[mask_bool] = color
-                overlay = cv2.addWeighted(overlay, 1.0, colored_mask, 0.4, 0)
-
-                # Draw mask contour
+                # Contour
                 contours, _ = cv2.findContours(
                     mask_bool.astype(np.uint8),
                     cv2.RETR_EXTERNAL,
                     cv2.CHAIN_APPROX_SIMPLE,
                 )
-                cv2.drawContours(overlay, contours, -1, color, 2)
+                cv2.drawContours(overlay, contours, -1, color_rgb.tolist(), 2)
 
-            # Draw bounding box
+            # Draw box
             if boxes.ndim > 1 and len(boxes[i]) == 4:
-                cx, cy, bw, bh = boxes[i]
-                x1 = int((cx - bw / 2) * w)
-                y1 = int((cy - bh / 2) * h)
-                x2 = int((cx + bw / 2) * w)
-                y2 = int((cy + bh / 2) * h)
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                x1, y1, x2, y2 = [int(v) for v in boxes[i]]
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), color_rgb.tolist(), 2)
 
-                # Draw score label
                 score = float(scores[i]) if scores.ndim > 0 else 0.0
                 label = f"{score:.2f}"
-                font_scale = 0.5
-                thickness = 1
-                (tw, th), _ = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+                (tw, th_text), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
                 )
                 cv2.rectangle(
-                    overlay,
-                    (x1, y1 - th - 6),
-                    (x1 + tw + 4, y1),
-                    color,
-                    -1,
+                    overlay, (x1, y1 - th_text - 6),
+                    (x1 + tw + 4, y1), color_rgb.tolist(), -1,
                 )
                 cv2.putText(
-                    overlay,
-                    label,
-                    (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    (255, 255, 255),
-                    thickness,
-                    cv2.LINE_AA,
+                    overlay, label, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1, cv2.LINE_AA,
                 )
 
-        output_path = Path(tempfile.mktemp(suffix=".png"))
-        result_image = Image.fromarray(overlay)
-        result_image.save(str(output_path))
-        return CogPath(output_path)
-
-    @staticmethod
-    def _generate_colors(n: int) -> list:
-        """Generate n visually distinct colors using HSV spacing."""
-        colors = []
-        for i in range(max(n, 1)):
-            hue = int(180 * i / max(n, 1))
-            hsv = np.array([[[hue, 255, 200]]], dtype=np.uint8)
-            rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[0][0]
-            colors.append(tuple(int(c) for c in rgb))
-        return colors
+        output_path = tempfile.mktemp(suffix=".png")
+        Image.fromarray(overlay).save(output_path)
+        return Path(output_path)
 
     @staticmethod
     def _mask_to_rle(mask: np.ndarray) -> dict:
-        """Encode a binary mask as run-length encoding (RLE)."""
+        """Encode a binary mask as run-length encoding."""
         if mask.ndim > 2:
             mask = mask.squeeze()
-        flat = mask.flatten().astype(np.uint8)
-        # Compute run lengths
+        flat = (mask > 0.5).flatten().astype(np.uint8)
         diff = np.diff(flat, prepend=0, append=0)
         starts = np.where(diff != 0)[0]
         lengths = np.diff(starts)
-        # Determine if first run is 0 or 1
-        if flat[0] == 1:
-            counts = [0] + lengths.tolist()
-        else:
-            counts = lengths.tolist()
-        return {
-            "counts": counts,
-            "size": list(mask.shape),
-        }
+        counts = [0] + lengths.tolist() if flat[0] == 1 else lengths.tolist()
+        return {"counts": counts, "size": list(mask.shape)}
