@@ -17,7 +17,7 @@ import torch
 from cog import BasePredictor, Input, Path
 from PIL import Image
 
-MODEL_PATH = "checkpoints"
+MODEL_PATH = "/src/checkpoints"
 MODEL_URL = "https://weights.replicate.delivery/default/facebook/sam3/model.tar"
 
 
