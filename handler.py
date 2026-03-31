@@ -65,10 +65,23 @@ def mask_to_rle(mask: np.ndarray) -> dict:
     if mask.ndim > 2:
         mask = mask.squeeze()
     flat = (mask > 0.5).flatten().astype(np.uint8)
-    diff = np.diff(flat, prepend=0, append=0)
-    starts = np.where(diff != 0)[0]
-    lengths = np.diff(starts)
-    counts = [0] + lengths.tolist() if flat[0] == 1 else lengths.tolist()
+
+    if len(flat) == 0:
+        return {"counts": [], "size": list(mask.shape)}
+
+    # find positions where the value changes
+    changes = np.where(np.diff(flat))[0] + 1
+    # include boundaries (0 and len) to capture first and last runs
+    positions = np.concatenate([[0], changes, [len(flat)]])
+    lengths = np.diff(positions)
+
+    # counts alternate starting with background (0).
+    # if the mask starts with foreground (1), prepend a 0-length bg run.
+    if flat[0] == 1:
+        counts = [0] + lengths.tolist()
+    else:
+        counts = lengths.tolist()
+
     return {"counts": counts, "size": list(mask.shape)}
 
 
