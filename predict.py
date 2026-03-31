@@ -41,9 +41,22 @@ class Predictor(BasePredictor):
             else torch.float16
         )
 
-        # Download weights on first run
+        # Debug: check what's actually at the model path
+        print(f"Checking MODEL_PATH: {MODEL_PATH}")
+        print(f"  exists: {os.path.exists(MODEL_PATH)}")
+        if os.path.exists(MODEL_PATH):
+            print(f"  contents: {os.listdir(MODEL_PATH)}")
+        else:
+            # Also check if it landed somewhere else
+            for check in ["/src", "/src/checkpoints", "/src/model"]:
+                if os.path.exists(check):
+                    print(f"  {check} exists, contents: {os.listdir(check)}")
+
+        # Download weights only if not baked into the image
         if not os.path.exists(MODEL_PATH):
+            print("Weights not found, downloading...")
             download_weights(MODEL_URL, MODEL_PATH)
+            print(f"  after download: {os.listdir(MODEL_PATH)}")
 
         print(f"Loading SAM 3 model on {self.device} with {self.dtype}...")
         self.model = (
@@ -125,10 +138,11 @@ class Predictor(BasePredictor):
         with torch.no_grad():
             outputs = self.model(**inputs)
 
-        # Post-process to get masks and scores
-        results = self.processor.post_process_segmentation(
+        # Post-process to get masks, boxes, and scores
+        results = self.processor.post_process_instance_segmentation(
             outputs,
             target_sizes=[(height, width)],
+            threshold=confidence_threshold,
         )[0]
 
         masks = results.get("masks", None)
@@ -140,14 +154,8 @@ class Predictor(BasePredictor):
         scores_np = self._to_numpy(scores)
         boxes_np = self._to_numpy(boxes)
 
-        # Filter by confidence
-        if scores_np is not None and scores_np.ndim > 0 and len(scores_np) > 0:
-            keep = scores_np >= confidence_threshold
-            scores_np = scores_np[keep]
-            if masks_np is not None and masks_np.ndim > 1:
-                masks_np = masks_np[keep]
-            if boxes_np is not None and boxes_np.ndim > 1:
-                boxes_np = boxes_np[keep]
+        # Note: threshold is already applied inside post_process_instance_segmentation,
+        # so no additional filtering is needed here.
 
         if output_format == "json":
             return self._output_json(masks_np, boxes_np, scores_np)
