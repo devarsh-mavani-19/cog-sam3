@@ -1,16 +1,3 @@
-"""
-RunPod Serverless handler for SAM 3 image segmentation.
-
-Accepts a job with the following input fields:
-  - image        (str, required): Base64-encoded image OR a public URL.
-  - text_prompt  (str, optional): Text description of objects to segment. Default: "object".
-  - box_prompt   (list, optional): Bounding box [x1, y1, x2, y2] in pixel coordinates.
-  - confidence_threshold (float, optional): Min confidence 0.0-1.0. Default: 0.5.
-  - mask_opacity (float, optional): Overlay opacity 0.0-1.0. Default: 0.5.
-  - mask_color   (str, optional): One of green/red/blue/yellow/cyan/magenta. Default: "green".
-  - output_format (str, optional): "png" (base64 annotated image) or "json" (structured). Default: "png".
-"""
-
 import base64
 import io
 import json
@@ -37,7 +24,6 @@ def download_weights(url: str, dest: str) -> None:
 
 
 def load_image(image_input: str) -> Image.Image:
-    """Load an image from a base64 string or URL."""
     if image_input.startswith(("http://", "https://")):
         import urllib.request
         with urllib.request.urlopen(image_input) as resp:
@@ -61,22 +47,18 @@ def to_numpy(tensor):
 
 
 def mask_to_rle(mask: np.ndarray) -> dict:
-    """Encode a binary mask as run-length encoding."""
     if mask.ndim > 2:
         mask = mask.squeeze()
-    flat = (mask > 0.5).flatten().astype(np.uint8)
 
-    if len(flat) == 0:
+    flat = (mask > 0.5).astype(np.uint8).flatten(order="F")
+
+    if flat.size == 0:
         return {"counts": [], "size": list(mask.shape)}
 
-    # find positions where the value changes
     changes = np.where(np.diff(flat))[0] + 1
-    # include boundaries (0 and len) to capture first and last runs
     positions = np.concatenate([[0], changes, [len(flat)]])
     lengths = np.diff(positions)
 
-    # counts alternate starting with background (0).
-    # if the mask starts with foreground (1), prepend a 0-length bg run.
     if flat[0] == 1:
         counts = [0] + lengths.tolist()
     else:
@@ -86,7 +68,6 @@ def mask_to_rle(mask: np.ndarray) -> dict:
 
 
 def build_visualization(pil_image, masks, boxes, scores, mask_opacity=0.5, mask_color="green"):
-    """Render annotated image with colored mask overlays."""
     img = np.array(pil_image)
     overlay = img.copy()
     h, w = img.shape[:2]
@@ -111,10 +92,8 @@ def build_visualization(pil_image, masks, boxes, scores, mask_opacity=0.5, mask_
                 mask = mask.squeeze()
 
             if mask.shape != (h, w):
-                mask = cv2.resize(
-                    mask.astype(np.float32), (w, h),
-                    interpolation=cv2.INTER_LINEAR,
-                )
+                mask = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
             mask_bool = mask > 0.5
 
             overlay[mask_bool] = (
@@ -132,95 +111,56 @@ def build_visualization(pil_image, masks, boxes, scores, mask_opacity=0.5, mask_
             x1, y1, x2, y2 = [int(v) for v in boxes[i]]
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color_rgb.tolist(), 2)
 
-            score = float(scores[i]) if scores.ndim > 0 else 0.0
-            label = f"{score:.2f}"
-            (tw, th_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(
-                overlay, (x1, y1 - th_text - 6),
-                (x1 + tw + 4, y1), color_rgb.tolist(), -1,
-            )
-            cv2.putText(
-                overlay, label, (x1 + 2, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (255, 255, 255), 1, cv2.LINE_AA,
-            )
-
     return Image.fromarray(overlay)
 
 
-# ---------------------------------------------------------------------------
-# Model loading (runs once at container start)
-# ---------------------------------------------------------------------------
+# ---------------- MODEL LOAD ----------------
 print("Initializing SAM 3 model...")
-print("CUDA available:", torch.cuda.is_available())
-print("Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
 if not os.path.exists(MODEL_PATH):
-    print("Weights not found locally, downloading...")
     download_weights(MODEL_URL, MODEL_PATH)
 
 from transformers import Sam3Model, Sam3Processor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = (
-    torch.bfloat16
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    else torch.float16
-)
+DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-print(f"Loading SAM 3 on {DEVICE} with {DTYPE}...")
 MODEL = Sam3Model.from_pretrained(MODEL_PATH).to(DEVICE, dtype=DTYPE).eval()
 PROCESSOR = Sam3Processor.from_pretrained(MODEL_PATH)
-print("SAM 3 model loaded successfully.")
+
+print("Model ready")
 
 
-# ---------------------------------------------------------------------------
-# RunPod handler
-# ---------------------------------------------------------------------------
+# ---------------- HANDLER ----------------
 def handler(job):
-    """Process a single RunPod serverless job."""
     job_input = job["input"]
 
-    # --- Parse inputs ---
     image_input = job_input.get("image")
     if not image_input:
-        return {"error": "Missing required field: 'image' (base64 string or URL)"}
+        return {"error": "Missing image"}
 
-    text_prompt = job_input.get("text_prompt", "object")
-    box_prompt = job_input.get("box_prompt", None)
+    text_prompt = job_input.get("text_prompt", "person")
     confidence_threshold = float(job_input.get("confidence_threshold", 0.5))
-    mask_opacity = float(job_input.get("mask_opacity", 0.5))
-    mask_color = job_input.get("mask_color", "green")
     output_format = job_input.get("output_format", "png")
 
-    # --- Load image ---
+    selected_indices = job_input.get("selected_indices", None)
+    return_mask_only = job_input.get("return_mask_only", False)
+
+    # Load image
     try:
         pil_image = load_image(image_input)
     except Exception as e:
-        return {"error": f"Failed to load image: {str(e)}"}
+        return {"error": str(e)}
 
     width, height = pil_image.size
 
-    # --- Build processor inputs ---
-    if box_prompt is not None:
-        if isinstance(box_prompt, str):
-            box_prompt = json.loads(box_prompt.strip())
-        if not isinstance(box_prompt, list) or len(box_prompt) != 4:
-            return {"error": "box_prompt must be a list of 4 numbers: [x1, y1, x2, y2]"}
-        inputs = PROCESSOR(
-            images=pil_image,
-            text=text_prompt,
-            input_boxes=[[box_prompt]],
-            return_tensors="pt",
-        ).to(DEVICE, dtype=DTYPE)
-    else:
-        inputs = PROCESSOR(
-            images=pil_image,
-            text=text_prompt,
-            return_tensors="pt",
-        ).to(DEVICE, dtype=DTYPE)
+    # Prepare input
+    inputs = PROCESSOR(
+        images=pil_image,
+        text=text_prompt,
+        return_tensors="pt",
+    ).to(DEVICE, dtype=DTYPE)
 
-    # --- Inference ---
     with torch.no_grad():
         outputs = MODEL(**inputs)
 
@@ -234,29 +174,73 @@ def handler(job):
     scores_np = to_numpy(results.get("scores", None))
     boxes_np = to_numpy(results.get("boxes", None))
 
-    # --- Build output ---
+    # ---------------- NEW: MASK MERGE ----------------
+    if selected_indices is not None:
+        try:
+            if isinstance(selected_indices, str):
+                selected_indices = json.loads(selected_indices)
+
+            selected_indices = [
+                i for i in selected_indices if 0 <= i < len(masks_np)
+            ]
+
+            if len(selected_indices) == 0:
+                return {"error": "No valid selected indices"}
+
+            selected_masks = masks_np[selected_indices]
+
+            combined_mask = np.any(selected_masks > 0.5, axis=0).astype(np.uint8)
+
+            if combined_mask.shape != (height, width):
+                combined_mask = cv2.resize(
+                    combined_mask,
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+            # expand mask slightly
+            kernel = np.ones((5, 5), np.uint8)
+            combined_mask = cv2.dilate(combined_mask, kernel, iterations=1)
+
+            if return_mask_only:
+                bw = (combined_mask * 255).astype(np.uint8)
+                img = Image.fromarray(bw)
+
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+
+                return {
+                    "mask_base64": base64.b64encode(buf.getvalue()).decode(),
+                    "num_selected": len(selected_indices)
+                }
+
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ---------------- DEFAULT OUTPUT ----------------
     if output_format == "json":
         detections = []
-        num = int(len(scores_np)) if scores_np.ndim > 0 else 0
-        for i in range(num):
+        for i in range(len(scores_np)):
             det = {
                 "score": float(scores_np[i]),
-                "box": boxes_np[i].tolist() if boxes_np.ndim > 1 else [],
+                "box": boxes_np[i].tolist(),
+                "mask_rle": mask_to_rle(masks_np[i])
             }
-            if masks_np.ndim > 2:
-                det["mask_rle"] = mask_to_rle(masks_np[i])
             detections.append(det)
-        return {"num_detections": num, "detections": detections}
+
+        return {"detections": detections}
+
     else:
         result_image = build_visualization(
-            pil_image, masks_np, boxes_np, scores_np,
-            mask_opacity=mask_opacity,
-            mask_color=mask_color,
+            pil_image, masks_np, boxes_np, scores_np
         )
+
         buf = io.BytesIO()
         result_image.save(buf, format="PNG")
-        b64_image = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return {"image_base64": b64_image}
+
+        return {
+            "image_base64": base64.b64encode(buf.getvalue()).decode()
+        }
 
 
 runpod.serverless.start({"handler": handler})
