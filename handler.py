@@ -189,7 +189,7 @@ def handler(job):
 
             selected_masks = masks_np[selected_indices]
 
-            combined_mask = np.any(selected_masks > 0.5, axis=0).astype(np.uint8)
+            combined_mask = np.max(selected_masks, axis=0).astype(np.uint8)
 
             if combined_mask.shape != (height, width):
                 combined_mask = cv2.resize(
@@ -199,8 +199,15 @@ def handler(job):
                 )
 
             # expand mask slightly
-            kernel = np.ones((5, 5), np.uint8)
-            combined_mask = cv2.dilate(combined_mask, kernel, iterations=1)
+            # 1. Stronger dilation (expand region properly)
+            kernel = np.ones((15, 15), np.uint8)
+            combined_mask = cv2.dilate(combined_mask.astype(np.uint8), kernel, iterations=1)
+
+            # 2. Convert to 0-255
+            combined_mask = combined_mask * 255
+
+            # 3. Feather edges (THIS is the key)
+            combined_mask = cv2.GaussianBlur(combined_mask, (21, 21), 0)
 
             if return_mask_only:
                 bw = (combined_mask * 255).astype(np.uint8)
