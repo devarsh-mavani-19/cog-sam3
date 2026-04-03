@@ -189,7 +189,29 @@ def handler(job):
 
             selected_masks = masks_np[selected_indices]
 
-            combined_mask = np.max(selected_masks, axis=0).astype(np.uint8)
+            # Start with float mask (NOT uint8)
+            combined_mask = np.max(selected_masks, axis=0).astype(np.float32)
+
+            # Resize if needed
+            if combined_mask.shape != (height, width):
+                combined_mask = cv2.resize(
+                    combined_mask,
+                    (width, height),
+                    interpolation=cv2.INTER_LINEAR
+                )
+
+            # 1. Dilate (still float)
+            kernel = np.ones((15, 15), np.uint8)
+            combined_mask = cv2.dilate((combined_mask > 0.5).astype(np.uint8), kernel, iterations=1)
+
+            # convert back to float
+            combined_mask = combined_mask.astype(np.float32)
+
+            # 2. Blur (THIS is key)
+            combined_mask = cv2.GaussianBlur(combined_mask, (21, 21), 0)
+
+            # 3. Normalize to 0–255
+            combined_mask = (combined_mask * 255).astype(np.uint8)
 
             if combined_mask.shape != (height, width):
                 combined_mask = cv2.resize(
@@ -200,17 +222,17 @@ def handler(job):
 
             # expand mask slightly
             # 1. Stronger dilation (expand region properly)
-            kernel = np.ones((15, 15), np.uint8)
-            combined_mask = cv2.dilate(combined_mask.astype(np.uint8), kernel, iterations=1)
+            # kernel = np.ones((15, 15), np.uint8)
+            # combined_mask = cv2.dilate(combined_mask.astype(np.uint8), kernel, iterations=1)
 
-            # 2. Convert to 0-255
-            combined_mask = combined_mask * 255
+            # # 2. Convert to 0-255
+            # combined_mask = combined_mask * 255
 
-            # 3. Feather edges (THIS is the key)
-            combined_mask = cv2.GaussianBlur(combined_mask, (21, 21), 0)
+            # # 3. Feather edges (THIS is the key)
+            # combined_mask = cv2.GaussianBlur(combined_mask, (21, 21), 0)
 
             if return_mask_only:
-                bw = (combined_mask * 255).astype(np.uint8)
+                bw = combined_mask
                 img = Image.fromarray(bw)
 
                 buf = io.BytesIO()
